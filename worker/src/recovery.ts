@@ -25,8 +25,8 @@ type RecoveryLogger = {
   info: (data: object, message: string) => void;
 };
 
-const jobOptions = (email: ScheduledEmail, now: number) => ({
-  jobId: `email:${email.id}`,
+const jobOptions = (email: ScheduledEmail, jobId: string, now: number) => ({
+  jobId,
   delay: Math.max(0, email.scheduledAt.getTime() - now),
   attempts: 3,
   backoff: { type: "exponential" as const, delay: 5000 },
@@ -49,9 +49,9 @@ export const ensureScheduledEmailJob = async ({
 }) => {
   if (email.status !== "scheduled" || email.bullJobId || (!allowPastDue && email.scheduledAt.getTime() < now)) return "skipped" as const;
 
-  const jobId = `email:${email.id}`;
+  const jobId = `email-${email.id}`;
   const existingJob = await queue.getJob(jobId);
-  const job = existingJob ?? await queue.add(`email:${email.id}`, { emailId: email.id }, jobOptions(email, now));
+  const job = existingJob ?? await queue.add(`email-${email.id}`, { emailId: email.id }, jobOptions(email, jobId, now));
   const persistedJobId = job.id ?? jobId;
   if (email.bullJobId !== persistedJobId) {
     await emailStore.update({ where: { id: email.id }, data: { bullJobId: persistedJobId } });
