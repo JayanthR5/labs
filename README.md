@@ -1,6 +1,6 @@
-# ReachInbox Email Scheduler
+# Email Scheduler
 
-A Docker-free ReachInbox-style email scheduler for Windows. It uses PostgreSQL as the durable source of email state, Redis/BullMQ for delayed jobs and distributed rate limiting, Ethereal SMTP for safe test delivery, and Elasticsearch for search.
+A Docker-free  email scheduler for Windows. It uses PostgreSQL as the durable source of email state, Redis/BullMQ for delayed jobs and distributed rate limiting, Ethereal SMTP for safe test delivery, and Elasticsearch for search.
 
 ## Features
 
