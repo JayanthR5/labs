@@ -7,6 +7,7 @@ import pino from "pino";
 import { shouldRetry } from "./retry";
 import { workerConfig } from "./config";
 import { recoverMissingScheduledJobs } from "./recovery";
+import { claimRateLimitNotification, notifyRateLimit } from "./slack";
 
 const logger = pino();
 const prisma = new PrismaClient();
@@ -84,16 +85,22 @@ const worker = new Worker(
       if (reason === "hourly limit") {
         logger.info({ emailId: email.id, senderId: email.senderId, hourlyLimit }, "Hourly rate limit reached");
         try {
-          const notified = await redis.set(`email-rate-notified:${email.senderId}:${hour}`, "1", "EX", 7200, "NX");
+          const slack = await prisma.slackConnection.findUnique({
+            where: { userId: email.campaign.userId },
+            select: { accessToken: true, channelId: true },
+          });
+          const notified = await claimRateLimitNotification(redis, `email-rate-notified:${email.senderId}:${hour}`);
           if (notified) {
-            const slack = await prisma.slackConnection.findUnique({ where: { userId: email.campaign.userId } });
-            if (slack) {
-              await fetch("https://slack.com/api/chat.postMessage", {
-                method: "POST",
-                headers: { authorization: `Bearer ${slack.accessToken}`, "content-type": "application/json" },
-                body: JSON.stringify({ channel: slack.channelId ?? slack.teamId, text: `Email Scheduler Alert\nSender: ${email.sender.email}\nHourly limit reached (${hourlyLimit} emails/hour). Remaining emails have been rescheduled.` }),
-              }).catch((error) => logger.warn({ error: error instanceof Error ? error.message : "Slack error", emailId: email.id }, "Slack notification failed"));
-            }
+            const queueCounts = await emailQueue.getJobCounts("waiting", "delayed");
+            await notifyRateLimit({
+              slack,
+              senderEmail: email.sender.email,
+              hourlyLimit,
+              sentCount: Number(await redis.get(`email-rate:${email.senderId}:${hour}`) ?? 0),
+              waitingCount: queueCounts.waiting + queueCounts.delayed,
+              campaignId: email.campaign.id,
+              logger,
+            });
           }
         } catch (error) {
           logger.warn({ error: error instanceof Error ? error.message : "Slack notification error", emailId: email.id }, "Slack notification check failed");

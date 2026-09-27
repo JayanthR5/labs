@@ -16,6 +16,8 @@ import { ExpressAdapter } from "@bull-board/express";
 import { env } from "./config";
 import { connection, emailQueue } from "./queue";
 import { campaignEmailIdempotencyKey, campaignIdempotencyKey, idempotencyKey, normalizeRecipients } from "./recipients";
+import { ensureScheduledEmailJob } from "./scheduling";
+import { exchangeSlackCode, listSlackChannels, slackOAuthUrl } from "./slack";
 
 const prisma = new PrismaClient();
 const elastic = new Client({
@@ -177,18 +179,25 @@ app.get("/api/senders", auth, async (req, res) =>
 app.post("/api/senders", auth, async (req, res) => {
   const data = z
     .object({
-      email: z.string().email(),
-      displayName: z.string().optional(),
-      smtpHost: z.string(),
-      smtpPort: z.number().int(),
-      smtpUser: z.string(),
-      smtpPassword: z.string(),
+      email: z.string().trim().email(),
+      displayName: z.string().trim().max(120).optional(),
+      smtpHost: z.string().trim().min(1),
+      smtpPort: z.coerce.number().int().min(1).max(65535),
+      smtpUser: z.string().trim().min(1),
+      smtpPassword: z.string().min(1),
     })
     .parse(req.body);
-  const sender = await prisma.sender.create({
-    data: { ...data, userId: req.user!.id },
-  });
-  res.status(201).json({ ...sender, smtpPassword: undefined });
+  try {
+    const sender = await prisma.sender.create({
+      data: { ...data, userId: req.user!.id },
+      select: { id: true, email: true, displayName: true, smtpHost: true, smtpPort: true },
+    });
+    res.status(201).json(sender);
+  } catch (error) {
+    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002")
+      return res.status(409).json({ error: "A sender with this email already exists" });
+    throw error;
+  }
 });
 app.post("/api/emails/schedule", auth, async (req, res) => {
   const data = scheduleSchema.parse(req.body);
@@ -246,26 +255,21 @@ app.post("/api/emails/schedule", auth, async (req, res) => {
     }
     throw error;
   }
-  await Promise.all(
-    campaign.emails.map(async (email) => {
-      const job = await emailQueue.add(
-        `email:${email.id}`,
-        { emailId: email.id },
-        {
-          jobId: `email:${email.id}`,
-          delay: Math.max(0, email.scheduledAt.getTime() - Date.now()),
-          attempts: 3,
-          backoff: { type: "exponential", delay: 5000 },
-          removeOnComplete: 1000,
-          removeOnFail: 1000,
-        },
-      );
+  const jobsToRemove = [] as Array<{ remove?: () => Promise<unknown> }>;
+  try {
+    for (const email of campaign.emails) {
+      const result = await ensureScheduledEmailJob({ email, queue: emailQueue });
+      jobsToRemove.push(result.job);
       await prisma.email.update({
         where: { id: email.id },
-        data: { bullJobId: job.id },
+        data: { bullJobId: result.jobId },
       });
-    }),
-  );
+    }
+  } catch (error) {
+    await Promise.allSettled(jobsToRemove.map((job) => job.remove?.() ?? Promise.resolve()));
+    await prisma.campaign.delete({ where: { id: campaign.id } });
+    return res.status(503).json({ error: "Unable to schedule email jobs" });
+  }
   res
     .status(201)
     .json({ campaignId: campaign.id, totalEmails: recipients.length });
@@ -356,76 +360,60 @@ app.get("/api/slack/connect", auth, (req, res) => {
     return res.status(503).json({ error: "Slack OAuth is not configured" });
   const state = randomUUID();
   req.session.slackState = state;
-  res.redirect(
-    `https://slack.com/oauth/v2/authorize?client_id=${encodeURIComponent(env.SLACK_CLIENT_ID)}&scope=chat:write,channels:read&redirect_uri=${encodeURIComponent(env.SLACK_REDIRECT_URI)}&state=${state}`,
-  );
+  res.redirect(slackOAuthUrl(env.SLACK_CLIENT_ID, env.SLACK_REDIRECT_URI, state));
 });
 app.get("/api/slack/callback", async (req, res, next) => {
   try {
-    if (
-      !req.user ||
-      !env.SLACK_CLIENT_ID ||
-      !env.SLACK_CLIENT_SECRET ||
-      req.query.state !== req.session.slackState
-    )
-      return res.status(400).send("Invalid Slack OAuth state");
-    const params = new URLSearchParams({
-      client_id: env.SLACK_CLIENT_ID,
-      client_secret: env.SLACK_CLIENT_SECRET,
-      code: String(req.query.code ?? ""),
-      redirect_uri: env.SLACK_REDIRECT_URI,
-    });
-    const response = await fetch("https://slack.com/api/oauth.v2.access", {
-      method: "POST",
-      headers: { "content-type": "application/x-www-form-urlencoded" },
-      body: params,
-    });
-    const payload = (await response.json()) as {
-      ok: boolean;
-      access_token?: string;
-      team?: { id?: string; name?: string };
-    };
-    if (!payload.ok || !payload.access_token || !payload.team?.id)
-      return res.status(502).send("Slack connection failed");
-    const channelsResponse = await fetch(
-      "https://slack.com/api/conversations.list?types=public_channel&limit=1",
-      { headers: { authorization: `Bearer ${payload.access_token}` } },
-    );
-    const channels = (await channelsResponse.json()) as {
-      channels?: Array<{ id?: string }>;
-    };
-    const channelId = channels.channels?.[0]?.id;
+    const failure = (message: string) => res.redirect(`${env.FRONTEND_URL}/dashboard?slack=error&message=${encodeURIComponent(message)}`);
+    if (!req.user || !env.SLACK_CLIENT_ID || !env.SLACK_CLIENT_SECRET || req.query.state !== req.session.slackState)
+      return failure("Slack authorization expired or is invalid");
+    if (req.query.error) return failure("Slack authorization was declined");
+    const code = String(req.query.code ?? "");
+    if (!code) return failure("Slack authorization code is missing");
+    req.session.slackState = undefined;
+    const connection = await exchangeSlackCode({ clientId: env.SLACK_CLIENT_ID, clientSecret: env.SLACK_CLIENT_SECRET, redirectUri: env.SLACK_REDIRECT_URI, code });
     await prisma.slackConnection.upsert({
       where: { userId: req.user.id },
       update: {
-        teamId: payload.team.id,
-        teamName: payload.team.name ?? "Slack workspace",
-        channelId,
-        accessToken: payload.access_token,
+        teamId: connection.teamId,
+        teamName: connection.teamName,
+        channelId: null,
+        accessToken: connection.accessToken,
       },
       create: {
         userId: req.user.id,
-        teamId: payload.team.id,
-        teamName: payload.team.name ?? "Slack workspace",
-        channelId,
-        accessToken: payload.access_token,
+        teamId: connection.teamId,
+        teamName: connection.teamName,
+        channelId: null,
+        accessToken: connection.accessToken,
       },
     });
-    res.redirect(`${env.FRONTEND_URL}/dashboard`);
+    res.redirect(`${env.FRONTEND_URL}/dashboard?slack=connected`);
   } catch (error) {
+    const message = error instanceof Error ? error.message : "Slack connection failed";
+    if (message === "Slack authorization failed") return res.redirect(`${env.FRONTEND_URL}/dashboard?slack=error&message=${encodeURIComponent(message)}`);
     next(error);
   }
 });
 app.get("/api/slack/status", auth, async (req, res) =>
-  res.json({
-    connected: Boolean(
-      await prisma.slackConnection.findUnique({
-        where: { userId: req.user!.id },
-        select: { id: true, teamId: true, teamName: true },
-      }),
-    ),
-  }),
+  res.json(await prisma.slackConnection.findUnique({ where: { userId: req.user!.id, }, select: { teamId: true, teamName: true, channelId: true } }).then(connection => ({ connected: Boolean(connection), ...connection }))),
 );
+app.get("/api/slack/channels", auth, async (req, res) => {
+  const connection = await prisma.slackConnection.findUnique({ where: { userId: req.user!.id } });
+  if (!connection) return res.status(404).json({ error: "Slack is not connected" });
+  try {
+    res.json({ channels: await listSlackChannels(connection.accessToken) });
+  } catch {
+    res.status(502).json({ error: "Unable to load Slack channels" });
+  }
+});
+app.post("/api/slack/channel", auth, async (req, res) => {
+  const data = z.object({ channelId: z.string().min(1) }).parse(req.body);
+  const connection = await prisma.slackConnection.findUnique({ where: { userId: req.user!.id } });
+  if (!connection) return res.status(404).json({ error: "Slack is not connected" });
+  await prisma.slackConnection.update({ where: { userId: req.user!.id }, data: { channelId: data.channelId } });
+  res.status(204).end();
+});
 app.post("/api/slack/disconnect", auth, async (req, res) => {
   await prisma.slackConnection.deleteMany({ where: { userId: req.user!.id } });
   res.status(204).end();
